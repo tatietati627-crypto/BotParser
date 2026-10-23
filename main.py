@@ -9,10 +9,10 @@ from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 # ================= КОНФИГУРАЦИЯ И ПЕРЕМЕННЫЕ =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_ID = int(os.getenv("API_ID"))
+API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING", "")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 TARGET_CHANNEL_ID = int(os.getenv("TARGET_CHANNEL_ID", "0"))
 STREAM_BASE_URL = os.getenv("STREAM_BASE_URL", "").rstrip("/")
 DELAY = int(os.getenv("DELAY_BETWEEN_REQUESTS", 4))
@@ -20,15 +20,9 @@ PORT = int(os.getenv("PORT", 8080))
 
 DB_FILE = "movies.json"
 
-# Клиент бота-пульта
-bot_client = TelegramClient("control_bot", API_ID, API_HASH)
-
-# Клиент юзербота (создается только если есть SESSION_STRING)
+bot_client = None
 user_client = None
-if SESSION_STRING:
-    user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
-# Состояния в памяти
 auth_state = {}
 movie_queue = []
 is_running = False
@@ -73,7 +67,7 @@ def parse_metadata(text):
 async def fetch_movie(movie_title: str):
     global user_client
     if not user_client or not user_client.is_connected():
-        return False, "Юзербот не подключен! Проверь SESSION_STRING."
+        return False, "Юзербот не подключен! Сначала примени SESSION_STRING."
 
     try:
         results = await user_client.inline_query("kinosmotrubot", movie_title)
@@ -126,132 +120,134 @@ async def run_worker():
     is_running = False
     await bot_client.send_message(ADMIN_ID, "✅ Очередь обработана или сбор остановлен!", buttons=get_keyboard())
 
-# ================= КЛАВИАТУРА И ХЕНДЛЕРЫ БОТА =================
+# ================= КЛАВИАТУРА =================
 def get_keyboard():
     return [
         [Button.inline("▶️ Старт", b"start_work"), Button.inline("⏹ Стоп", b"stop_work")],
         [Button.inline("📊 Прогресс", b"status"), Button.inline("📁 База JSON", b"get_db")]
     ]
 
-@bot_client.on(events.NewMessage(chats=ADMIN_ID))
-async def handle_admin_messages(event):
-    global movie_queue, auth_state
-    text = event.raw_text.strip()
-    chat_id = event.chat_id
+# ================= РЕГИСТРАЦИЯ ХЕНДЛЕРОВ =================
+def setup_handlers():
+    @bot_client.on(events.NewMessage(chats=ADMIN_ID))
+    async def handle_admin_messages(event):
+        global movie_queue, auth_state
+        text = event.raw_text.strip()
+        chat_id = event.chat_id
 
-    # 1. Авторизация аккаунта прямо из чата
-    if text == "/login":
-        auth_state[chat_id] = {
-            "step": "phone",
-            "client": TelegramClient(StringSession(), API_ID, API_HASH)
-        }
-        await auth_state[chat_id]["client"].connect()
-        await event.reply("📱 **Шаг 1/3:** Отправь номер телефона в международном формате (например, `+380XXXXXXXXX`):")
-        return
-
-    if chat_id in auth_state:
-        state = auth_state[chat_id]
-        client = state["client"]
-
-        if state["step"] == "phone":
-            phone = text.replace(" ", "")
-            state["phone"] = phone
-            try:
-                sent = await client.send_code_request(phone)
-                state["phone_code_hash"] = sent.phone_code_hash
-                state["step"] = "code"
-                await event.reply("📩 **Шаг 2/3:** Код выслан в Telegram! Пришли его (лучше через пробелы, например: `1 2 3 4 5`):")
-            except Exception as e:
-                await event.reply(f"❌ Ошибка отправки кода: {e}\nНачни заново: /login")
-                del auth_state[chat_id]
+        # 1. Авторизация аккаунта прямо из чата
+        if text == "/login":
+            auth_state[chat_id] = {
+                "step": "phone",
+                "client": TelegramClient(StringSession(), API_ID, API_HASH)
+            }
+            await auth_state[chat_id]["client"].connect()
+            await event.reply("📱 **Шаг 1/3:** Отправь номер телефона в международном формате (например, `+380XXXXXXXXX`):")
             return
 
-        elif state["step"] == "code":
-            code = text.replace(" ", "").replace("-", "")
-            try:
-                await client.sign_in(phone=state["phone"], code=code, phone_code_hash=state["phone_code_hash"])
-                session_str = client.session.save()
-                await event.reply(
-                    "🎉 **Авторизация прошла успешно!**\n\n"
-                    "Скопируй строку ниже и вставь в переменную `SESSION_STRING` на Render:\n\n"
-                    f"`{session_str}`"
-                )
-                del auth_state[chat_id]
-            except SessionPasswordNeededError:
-                state["step"] = "password"
-                await event.reply("🔒 **Шаг 3/3:** Включена двухфакторная защита (2FA). Пришли пароль от аккаунта:")
-            except Exception as e:
-                await event.reply(f"❌ Ошибка кода: {e}\nПопробуй заново: /login")
-                del auth_state[chat_id]
+        if chat_id in auth_state:
+            state = auth_state[chat_id]
+            client = state["client"]
+
+            if state["step"] == "phone":
+                phone = text.replace(" ", "")
+                state["phone"] = phone
+                try:
+                    sent = await client.send_code_request(phone)
+                    state["phone_code_hash"] = sent.phone_code_hash
+                    state["step"] = "code"
+                    await event.reply("📩 **Шаг 2/3:** Код выслан в Telegram! Пришли его (лучше через пробелы, например: `1 2 3 4 5`):")
+                except Exception as e:
+                    await event.reply(f"❌ Ошибка отправки кода: {e}\nНачни заново: /login")
+                    del auth_state[chat_id]
+                return
+
+            elif state["step"] == "code":
+                code = text.replace(" ", "").replace("-", "")
+                try:
+                    await client.sign_in(phone=state["phone"], code=code, phone_code_hash=state["phone_code_hash"])
+                    session_str = client.session.save()
+                    await event.reply(
+                        "🎉 **Авторизация прошла успешно!**\n\n"
+                        "Скопируй строку ниже и вставь в переменную `SESSION_STRING` на Render:\n\n"
+                        f"`{session_str}`"
+                    )
+                    del auth_state[chat_id]
+                except SessionPasswordNeededError:
+                    state["step"] = "password"
+                    await event.reply("🔒 **Шаг 3/3:** Включена двухфакторная защита (2FA). Пришли пароль от аккаунта:")
+                except Exception as e:
+                    await event.reply(f"❌ Ошибка кода: {e}\nПопробуй заново: /login")
+                    del auth_state[chat_id]
+                return
+
+            elif state["step"] == "password":
+                try:
+                    await client.sign_in(password=text)
+                    session_str = client.session.save()
+                    await event.reply(
+                        "🎉 **Авторизация прошла успешно!**\n\n"
+                        "Скопируй строку ниже и вставь в переменную `SESSION_STRING` на Render:\n\n"
+                        f"`{session_str}`"
+                    )
+                except Exception as e:
+                    await event.reply(f"❌ Ошибка пароля: {e}\nПопробуй заново: /login")
+                finally:
+                    del auth_state[chat_id]
+                return
+
+        # 2. Обычные команды
+        if text == "/start":
+            await event.reply(
+                "🎬 **Панель управления Movie Cinema**\n\n"
+                "• Чтобы получить ключ сессии, отправь `/login`.\n"
+                "• Чтобы добавить фильмы в очередь, просто отправь их названия списком (каждое с новой строки).",
+                buttons=get_keyboard()
+            )
             return
 
-        elif state["step"] == "password":
-            try:
-                await client.sign_in(password=text)
-                session_str = client.session.save()
-                await event.reply(
-                    "🎉 **Авторизация прошла успешно!**\n\n"
-                    "Скопируй строку ниже и вставь в переменную `SESSION_STRING` на Render:\n\n"
-                    f"`{session_str}`"
-                )
-            except Exception as e:
-                await event.reply(f"❌ Ошибка пароля: {e}\nПопробуй заново: /login")
-            finally:
-                del auth_state[chat_id]
+        # Добавление названий в очередь
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        if lines:
+            movie_queue.extend(lines)
+            await event.reply(f"📥 Добавлено в очередь: **{len(lines)}** шт. Всего: **{len(movie_queue)}**.")
+
+    @bot_client.on(events.CallbackQuery)
+    async def handle_buttons(event):
+        global is_running, movie_queue
+        if event.sender_id != ADMIN_ID:
             return
 
-    # 2. Обычные команды
-    if text == "/start":
-        await event.reply(
-            "🎬 **Панель управления Movie Cinema**\n\n"
-            "• Чтобы получить ключ сессии, отправь `/login`.\n"
-            "• Чтобы добавить фильмы в очередь, просто отправь их названия списком (каждое с новой строки).",
-            buttons=get_keyboard()
-        )
-        return
+        data = event.data
+        if data == b"start_work":
+            if not SESSION_STRING or SESSION_STRING.lower() in ("none", "1", ""):
+                await event.answer("Сначала настрой SESSION_STRING через команду /login!", alert=True)
+                return
+            if is_running:
+                await event.answer("Сбор уже запущен!", alert=True)
+                return
+            if not movie_queue:
+                await event.answer("Очередь пуста! Пришли названия фильмов текстом.", alert=True)
+                return
 
-    # Добавление названий в очередь
-    lines = [line.strip() for line in text.split("\n") if line.strip()]
-    if lines:
-        movie_queue.extend(lines)
-        await event.reply(f"📥 Добавлено в очередь: **{len(lines)}** шт. Всего: **{len(movie_queue)}**.")
+            is_running = True
+            await event.edit("🚀 Сбор запущен!", buttons=get_keyboard())
+            asyncio.create_task(run_worker())
 
-@bot_client.on(events.CallbackQuery)
-async def handle_buttons(event):
-    global is_running, movie_queue
-    if event.sender_id != ADMIN_ID:
-        return
+        elif data == b"stop_work":
+            is_running = False
+            await event.edit("⏹ Сбор будет остановлен после текущего фильма.", buttons=get_keyboard())
 
-    data = event.data
-    if data == b"start_work":
-        if not SESSION_STRING:
-            await event.answer("Сначала настрой SESSION_STRING через команду /login!", alert=True)
-            return
-        if is_running:
-            await event.answer("Сбор уже запущен!", alert=True)
-            return
-        if not movie_queue:
-            await event.answer("Очередь пуста! Пришли названия фильмов текстом.", alert=True)
-            return
+        elif data == b"status":
+            await event.answer(f"В очереди: {len(movie_queue)} шт.\nСтатус: {'Работает' if is_running else 'Стоит'}", alert=True)
 
-        is_running = True
-        await event.edit("🚀 Сбор запущен!", buttons=get_keyboard())
-        asyncio.create_task(run_worker())
+        elif data == b"get_db":
+            if os.path.exists(DB_FILE):
+                await bot_client.send_file(ADMIN_ID, DB_FILE, caption="📁 Текущая база movies.json")
+            else:
+                await event.answer("База пока пуста.", alert=True)
 
-    elif data == b"stop_work":
-        is_running = False
-        await event.edit("⏹ Сбор будет остановлен после текущего фильма.", buttons=get_keyboard())
-
-    elif data == b"status":
-        await event.answer(f"В очереди: {len(movie_queue)} шт.\nСтатус: {'Работает' if is_running else 'Стоит'}", alert=True)
-
-    elif data == b"get_db":
-        if os.path.exists(DB_FILE):
-            await bot_client.send_file(ADMIN_ID, DB_FILE, caption="📁 Текущая база movies.json")
-        else:
-            await event.answer("База пока пуста.", alert=True)
-
-# ================= ВЕБ-СЕРВЕР ДЛЯ RENDER WEB SERVICE =================
+# ================= ВЕБ-СЕРВЕР ДЛЯ RENDER =================
 async def health_check(request):
     return web.Response(text="Bot is running!")
 
@@ -266,13 +262,21 @@ async def start_web_server():
 
 # ================= ТОЧКА ВХОДА =================
 async def main():
+    global bot_client, user_client
+
+    # Создаем клиенты внутри рабочего асинхронного цикла
+    bot_client = TelegramClient("control_bot", API_ID, API_HASH)
+    setup_handlers()
+
     await bot_client.start(bot_token=BOT_TOKEN)
     print("Бот управления успешно авторизован.")
 
-    if SESSION_STRING:
+    # Юзербот запускается только если задана настоящая сессия
+    if SESSION_STRING and SESSION_STRING.lower() not in ("none", "1", ""):
         try:
+            user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
             await user_client.start()
-            print("Юзербот подключен по SESSION_STRING!")
+            print("Юзербот успешно подключен по SESSION_STRING!")
         except Exception as e:
             print(f"Ошибка подключения юзербота: {e}")
 
