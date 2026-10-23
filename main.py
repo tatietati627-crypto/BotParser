@@ -5,9 +5,9 @@ import asyncio
 from aiohttp import web
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError, FloodWaitError
+from telethon.errors import FloodWaitError
 
-# ================= КОНФИГУРАЦИЯ И ПЕРЕМЕННЫЕ =================
+# ================= КОНФИГУРАЦИЯ =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH")
@@ -23,7 +23,6 @@ DB_FILE = "movies.json"
 bot_client = None
 user_client = None
 
-auth_state = {}
 movie_queue = []
 is_running = False
 
@@ -43,6 +42,7 @@ def save_db(data):
 
 def parse_metadata(text):
     data = {"kp": None, "imdb": None, "year": None}
+    
     kp_match = re.search(r"kp:([\d\.]+)", text, re.IGNORECASE)
     if kp_match:
         try:
@@ -63,29 +63,59 @@ def parse_metadata(text):
 
     return data
 
-# ================= ЛОГИКА ЮЗЕРБОТА =================
+# ================= ЛОГИКА ВОРКЕРА =================
 async def fetch_movie(movie_title: str):
     global user_client
     if not user_client or not user_client.is_connected():
-        return False, "Юзербот не подключен! Сначала примени SESSION_STRING."
+        return False, "Юзербот не подключен! Проверь SESSION_STRING."
+
+    bot_username = "kinosmotrubot"
 
     try:
-        results = await user_client.inline_query("kinosmotrubot", movie_title)
+        # 1. Поиск фильма в инлайне
+        results = await user_client.inline_query(bot_username, movie_title)
         if not results:
             return False, f"Ничего не найдено по запросу: {movie_title}"
 
         first_result = results[0]
         meta = parse_metadata(f"{first_result.title} {first_result.description}")
 
-        sent_msg = await first_result.click("me")
-        await asyncio.sleep(3)
+        # 2. Нажимаем на результат в Saved Messages, чтобы бот вернул код фильма (kino_...)
+        sent_inline = await first_result.click("me")
+        await asyncio.sleep(2)
 
-        fresh_msg = await user_client.get_messages("me", ids=sent_msg.id)
-        forwarded = await user_client.forward_messages(TARGET_CHANNEL_ID, fresh_msg)
+        inline_msg = await user_client.get_messages("me", ids=sent_inline.id)
+        code_text = inline_msg.raw_text.strip()
+        await inline_msg.delete()
+
+        if not code_text:
+            return False, f"Не удалось получить код фильма для: {first_result.title}"
+
+        # 3. Отправляем полученный код боту @kinosmotrubot в ЛС
+        await user_client.send_message(bot_username, f"/start {code_text}")
+        await asyncio.sleep(4)
+
+        # 4. Проверяем ответ от бота (ищем видеосообщение)
+        bot_msgs = await user_client.get_messages(bot_username, limit=1)
+        if not bot_msgs or not (bot_msgs[0].video or bot_msgs[0].document):
+            # Если бот не среагировал на команду с /start, пробуем отправить голый код
+            await user_client.send_message(bot_username, code_text)
+            await asyncio.sleep(4)
+            bot_msgs = await user_client.get_messages(bot_username, limit=1)
+
+        target_media_msg = bot_msgs[0]
+
+        if not (target_media_msg.video or target_media_msg.document):
+            return False, f"Бот вернул текст вместо файла видео: {target_media_msg.raw_text[:50]}"
+
+        # 5. Пересылаем полученное видео в целевой канал
+        forwarded = await user_client.forward_messages(TARGET_CHANNEL_ID, target_media_msg)
         channel_msg_id = forwarded.id
 
+        # 6. Добавляем фильм в movies.json
         entry = {
             "title": first_result.title,
+            "code": code_text,
             "year": meta["year"],
             "kp": meta["kp"],
             "imdb": meta["imdb"],
@@ -97,14 +127,13 @@ async def fetch_movie(movie_title: str):
         db.append(entry)
         save_db(db)
 
-        await fresh_msg.delete()
-        return True, f"Успешно сохранен: {first_result.title} (ID: {channel_msg_id})"
+        return True, f"Готово: {first_result.title} переслан в канал (ID: {channel_msg_id})"
 
     except FloodWaitError as e:
         await asyncio.sleep(e.seconds)
         return False, f"FloodWait от Telegram: пауза {e.seconds} сек."
     except Exception as e:
-        return False, f"Ошибка при сборе '{movie_title}': {str(e)}"
+        return False, f"Ошибка при обработке '{movie_title}': {str(e)}"
 
 async def run_worker():
     global is_running, movie_queue
@@ -118,95 +147,29 @@ async def run_worker():
         await asyncio.sleep(DELAY)
 
     is_running = False
-    await bot_client.send_message(ADMIN_ID, "✅ Очередь обработана или сбор остановлен!", buttons=get_keyboard())
+    await bot_client.send_message(ADMIN_ID, "✅ Очередь завершена или сбор остановлен!", buttons=get_keyboard())
 
-# ================= КЛАВИАТУРА =================
+# ================= КЛАВИАТУРА И ХЕНДЛЕРЫ =================
 def get_keyboard():
     return [
         [Button.inline("▶️ Старт", b"start_work"), Button.inline("⏹ Стоп", b"stop_work")],
         [Button.inline("📊 Прогресс", b"status"), Button.inline("📁 База JSON", b"get_db")]
     ]
 
-# ================= РЕГИСТРАЦИЯ ХЕНДЛЕРОВ =================
 def setup_handlers():
     @bot_client.on(events.NewMessage(chats=ADMIN_ID))
     async def handle_admin_messages(event):
-        global movie_queue, auth_state
+        global movie_queue
         text = event.raw_text.strip()
-        chat_id = event.chat_id
 
-        # 1. Авторизация аккаунта прямо из чата
-        if text == "/login":
-            auth_state[chat_id] = {
-                "step": "phone",
-                "client": TelegramClient(StringSession(), API_ID, API_HASH)
-            }
-            await auth_state[chat_id]["client"].connect()
-            await event.reply("📱 **Шаг 1/3:** Отправь номер телефона в международном формате (например, `+380XXXXXXXXX`):")
-            return
-
-        if chat_id in auth_state:
-            state = auth_state[chat_id]
-            client = state["client"]
-
-            if state["step"] == "phone":
-                phone = text.replace(" ", "")
-                state["phone"] = phone
-                try:
-                    sent = await client.send_code_request(phone)
-                    state["phone_code_hash"] = sent.phone_code_hash
-                    state["step"] = "code"
-                    await event.reply("📩 **Шаг 2/3:** Код выслан в Telegram! Пришли его (лучше через пробелы, например: `1 2 3 4 5`):")
-                except Exception as e:
-                    await event.reply(f"❌ Ошибка отправки кода: {e}\nНачни заново: /login")
-                    del auth_state[chat_id]
-                return
-
-            elif state["step"] == "code":
-                code = text.replace(" ", "").replace("-", "")
-                try:
-                    await client.sign_in(phone=state["phone"], code=code, phone_code_hash=state["phone_code_hash"])
-                    session_str = client.session.save()
-                    await event.reply(
-                        "🎉 **Авторизация прошла успешно!**\n\n"
-                        "Скопируй строку ниже и вставь в переменную `SESSION_STRING` на Render:\n\n"
-                        f"`{session_str}`"
-                    )
-                    del auth_state[chat_id]
-                except SessionPasswordNeededError:
-                    state["step"] = "password"
-                    await event.reply("🔒 **Шаг 3/3:** Включена двухфакторная защита (2FA). Пришли пароль от аккаунта:")
-                except Exception as e:
-                    await event.reply(f"❌ Ошибка кода: {e}\nПопробуй заново: /login")
-                    del auth_state[chat_id]
-                return
-
-            elif state["step"] == "password":
-                try:
-                    await client.sign_in(password=text)
-                    session_str = client.session.save()
-                    await event.reply(
-                        "🎉 **Авторизация прошла успешно!**\n\n"
-                        "Скопируй строку ниже и вставь в переменную `SESSION_STRING` на Render:\n\n"
-                        f"`{session_str}`"
-                    )
-                except Exception as e:
-                    await event.reply(f"❌ Ошибка пароля: {e}\nПопробуй заново: /login")
-                finally:
-                    del auth_state[chat_id]
-                return
-
-        # 2. Обычные команды
         if text == "/start":
             await event.reply(
-                "🎬 **Панель управления Movie Cinema**\n\n"
-                "• Чтобы получить ключ сессии, отправь `/login`.\n"
-                "• Чтобы добавить фильмы в очередь, просто отправь их названия списком (каждое с новой строки).",
+                "🎬 **Панель управления сбором фильмов**\n\n"
+                "Отправь названия фильмов (каждое с новой строки), чтобы добавить их в очередь.",
                 buttons=get_keyboard()
             )
             return
 
-        # Добавление названий в очередь
         lines = [line.strip() for line in text.split("\n") if line.strip()]
         if lines:
             movie_queue.extend(lines)
@@ -220,14 +183,11 @@ def setup_handlers():
 
         data = event.data
         if data == b"start_work":
-            if not SESSION_STRING or SESSION_STRING.lower() in ("none", "1", ""):
-                await event.answer("Сначала настрой SESSION_STRING через команду /login!", alert=True)
-                return
             if is_running:
-                await event.answer("Сбор уже запущен!", alert=True)
+                await event.answer("Сбор уже идет!", alert=True)
                 return
             if not movie_queue:
-                await event.answer("Очередь пуста! Пришли названия фильмов текстом.", alert=True)
+                await event.answer("Очередь пуста! Отправь названия фильмов текстом.", alert=True)
                 return
 
             is_running = True
@@ -243,7 +203,7 @@ def setup_handlers():
 
         elif data == b"get_db":
             if os.path.exists(DB_FILE):
-                await bot_client.send_file(ADMIN_ID, DB_FILE, caption="📁 Текущая база movies.json")
+                await bot_client.send_file(ADMIN_ID, DB_FILE, caption="📁 Актуальная база movies.json")
             else:
                 await event.answer("База пока пуста.", alert=True)
 
@@ -264,21 +224,15 @@ async def start_web_server():
 async def main():
     global bot_client, user_client
 
-    # Создаем клиенты внутри рабочего асинхронного цикла
     bot_client = TelegramClient("control_bot", API_ID, API_HASH)
     setup_handlers()
-
     await bot_client.start(bot_token=BOT_TOKEN)
-    print("Бот управления успешно авторизован.")
+    print("Бот управления запущен.")
 
-    # Юзербот запускается только если задана настоящая сессия
-    if SESSION_STRING and SESSION_STRING.lower() not in ("none", "1", ""):
-        try:
-            user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-            await user_client.start()
-            print("Юзербот успешно подключен по SESSION_STRING!")
-        except Exception as e:
-            print(f"Ошибка подключения юзербота: {e}")
+    if SESSION_STRING:
+        user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+        await user_client.start()
+        print("Юзербот подключен по SESSION_STRING!")
 
     await start_web_server()
     await bot_client.run_until_disconnected()
